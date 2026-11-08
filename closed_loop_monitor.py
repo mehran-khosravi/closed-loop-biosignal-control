@@ -1,186 +1,306 @@
+import sys
 import numpy as np
 from scipy.signal import butter, filtfilt, find_peaks
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+
+import tkinter as tk
+from tkinter import ttk
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 
 class BiosignalProcessor:
-    def __init__(self, fs=250):
-        self.fs = fs
+    def __init__(self, sampling_rate=250):
+        self.fs = sampling_rate
 
-    def bandpass_filter(self, signal_data, lowcut=0.5, highcut=40.0, order=4):
-        nyq = 0.5 * self.fs
-        low = lowcut / nyq
-        high = highcut / nyq
-        b, a = butter(order, [low, high], btype="band")
-        return filtfilt(b, a, signal_data)
+    def bandpass_filter(self, signal, lowcut=0.5, highcut=40.0, order=3):
+        nyquist = 0.5 * self.fs
+        low = lowcut / nyquist
+        high = highcut / nyquist
+        b, a = butter(order, [low, high], btype='band')
+        return filtfilt(b, a, signal)
 
-    def extract_ecg_features(self, raw_ecg):
-        filtered = self.bandpass_filter(raw_ecg)
-        min_distance = int(0.3 * self.fs)
-        peaks, _ = find_peaks(filtered, distance=min_distance, height=np.std(filtered) * 1.2)
+    def extract_features(self, ecg_window):
+        filtered = self.bandpass_filter(ecg_window)
+        peaks, _ = find_peaks(filtered, distance=self.fs * 0.4, height=np.mean(filtered) + 0.3 * np.std(filtered))
+        
+        if len(peaks) > 1:
+            rr_intervals_ms = (np.diff(peaks) / self.fs) * 1000.0
+            hr_bpm = 60000.0 / np.mean(rr_intervals_ms)
+            sdnn_ms = np.std(rr_intervals_ms)
+            rmssd_ms = np.sqrt(np.mean(np.diff(rr_intervals_ms) ** 2)) if len(rr_intervals_ms) > 1 else 0.0
+        else:
+            hr_bpm = 70.0
+            sdnn_ms = 40.0
+            rmssd_ms = 30.0
 
-        if len(peaks) < 2:
-            return {"hr_bpm": 0.0, "sdnn_ms": 0.0, "rmssd_ms": 0.0}
-
-        rr_intervals = np.diff(peaks) / self.fs * 1000.0
-        hr_bpm = 60000.0 / np.mean(rr_intervals)
-        sdnn_ms = np.std(rr_intervals)
-        rmssd_ms = np.sqrt(np.mean(np.square(np.diff(rr_intervals))))
-
-        return {
-            "hr_bpm": round(float(hr_bpm), 2),
-            "sdnn_ms": round(float(sdnn_ms), 2),
-            "rmssd_ms": round(float(rmssd_ms), 2),
+        return filtered, peaks, {
+            'hr_bpm': hr_bpm,
+            'sdnn_ms': sdnn_ms,
+            'rmssd_ms': rmssd_ms
         }
 
 
-class ProportionalValveActuator:
-    def __init__(self, kp=1.4, ki=0.05, max_flow_rate_ul_min=50.0):
+class ClosedLoopActuator:
+    def __init__(self, kp=1.2, ki=0.05, kd=0.1, max_flow_ul_min=50.0):
         self.kp = kp
         self.ki = ki
-        self.max_flow_rate = max_flow_rate_ul_min
-        self.integral_error = 0.0
+        self.kd = kd
+        self.max_flow = max_flow_ul_min
+        self.integral = 0.0
+        self.prev_error = 0.0
 
-    def compute_actuation(self, risk_probability, spo2_level, target_spo2=96.0):
-        if risk_probability < 0.65:
-            self.integral_error = 0.0
-            return {"valve_open_pct": 0.0, "flow_rate_ul_min": 0.0, "status": "STANDBY"}
+    def compute_actuation(self, risk_score):
+        error = risk_score - 0.20
+        if error > 0:
+            self.integral += error
+            derivative = error - self.prev_error
+            control_signal = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+            self.prev_error = error
+            valve_pct = np.clip(control_signal * 100.0, 0.0, 100.0)
+        else:
+            self.integral = 0.0
+            self.prev_error = 0.0
+            valve_pct = 0.0
 
-        spo2_deficit = max(0.0, target_spo2 - spo2_level)
-        error = (risk_probability * 10.0) + spo2_deficit
-        self.integral_error += error
-
-        control_output = (self.kp * error) + (self.ki * self.integral_error)
-        valve_pct = float(np.clip(control_output * 5.0, 0.0, 100.0))
-        flow_rate = round((valve_pct / 100.0) * self.max_flow_rate, 2)
-
+        flow_rate = (valve_pct / 100.0) * self.max_flow
+        status = "ACTIVE_INFUSION" if valve_pct > 10.0 else "STANDBY"
+        
         return {
-            "valve_open_pct": round(valve_pct, 1),
-            "flow_rate_ul_min": flow_rate,
-            "status": "ACTIVE_DELIVERY",
+            'valve_open_pct': valve_pct,
+            'flow_rate_ul_min': flow_rate,
+            'status': status
         }
 
 
-class MetabolicDietAnalyzer:
-    def evaluate_profile(self, glucose_mg_dl, triglycerides_mg_dl, sleep_hours, spo2_pct):
-        recommendations = []
-        metabolic_state = "NORMAL"
+class DiagnosticModel:
+    def __init__(self):
+        self.clf = RandomForestClassifier(n_estimators=30, random_state=42)
+        self._train_baseline()
 
-        if glucose_mg_dl >= 140.0:
-            metabolic_state = "ELEVATED_GLYCEMIC"
-            recommendations.append("Reduce simple carbohydrate intake; prioritize low-glycemic fiber.")
-        elif glucose_mg_dl < 70.0:
-            metabolic_state = "HYPOGLYCEMIC_ALERT"
-            recommendations.append("Immediate intake of 15g fast-acting carbohydrates required.")
+    def _train_baseline(self):
+        np.random.seed(42)
+        # Normal physiologic profiles
+        hr_norm = np.random.normal(72, 8, 200)
+        sdnn_norm = np.random.normal(50, 10, 200)
+        rmssd_norm = np.random.normal(40, 8, 200)
+        x_norm = np.column_stack((hr_norm, sdnn_norm, rmssd_norm))
+        y_norm = np.zeros(200)
 
-        if triglycerides_mg_dl > 150.0:
-            if metabolic_state == "NORMAL":
-                metabolic_state = "DYSLIPIDEMIC"
-            recommendations.append("Limit saturated fats; increase omega-3 fatty acid ratio.")
+        # Acute cardiac / ischemia profiles
+        hr_acute = np.random.normal(135, 15, 200)
+        sdnn_acute = np.random.normal(10, 4, 200)
+        rmssd_acute = np.random.normal(8, 3, 200)
+        x_acute = np.column_stack((hr_acute, sdnn_acute, rmssd_acute))
+        y_acute = np.ones(200)
 
-        if sleep_hours < 6.0:
-            recommendations.append("Sleep deficit detected; adjust evening caloric timing to stabilize cortisol.")
+        x = np.vstack((x_norm, x_acute))
+        y = np.concatenate((y_norm, y_acute))
+        self.clf.fit(x, y)
 
-        if spo2_pct < 94.0:
-            recommendations.append("Low nocturnal/resting SpO2; monitor respiratory efficiency.")
-
-        if not recommendations:
-            recommendations.append("Metabolic biomarkers within target range. Maintain current macronutrient balance.")
-
-        return {
-            "metabolic_state": metabolic_state,
-            "dietary_adjustments": recommendations,
-        }
+    def evaluate_risk(self, metrics):
+        vec = np.array([[metrics['hr_bpm'], metrics['sdnn_ms'], metrics['rmssd_ms']]])
+        return self.clf.predict_proba(vec)[0][1]
 
 
-def build_synthetic_dataset(n_samples=600, random_state=42):
-    rng = np.random.default_rng(random_state)
-    # Features: [hr_bpm, sdnn_ms, rmssd_ms, spo2_pct, glucose_mg_dl, triglycerides_mg_dl]
-    normal_hr = rng.normal(72, 8, n_samples // 2)
-    normal_sdnn = rng.normal(55, 12, n_samples // 2)
-    normal_rmssd = rng.normal(42, 10, n_samples // 2)
-    normal_spo2 = rng.normal(97.5, 1.0, n_samples // 2)
-    normal_gluc = rng.normal(95, 12, n_samples // 2)
-    normal_trig = rng.normal(115, 20, n_samples // 2)
+class MonitorGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Closed-Loop Telemetry & Micro-Actuator Monitor")
+        self.root.geometry("1050x700")
+        self.root.configure(bg="#1e1e1e")
 
-    acute_hr = rng.normal(135, 18, n_samples // 2)
-    acute_sdnn = rng.normal(18, 6, n_samples // 2)
-    acute_rmssd = rng.normal(12, 4, n_samples // 2)
-    acute_spo2 = rng.normal(90.5, 2.5, n_samples // 2)
-    acute_gluc = rng.normal(155, 25, n_samples // 2)
-    acute_trig = rng.normal(190, 35, n_samples // 2)
+        self.processor = BiosignalProcessor(sampling_rate=250)
+        self.actuator = ClosedLoopActuator()
+        self.model = DiagnosticModel()
 
-    X_normal = np.column_stack([normal_hr, normal_sdnn, normal_rmssd, normal_spo2, normal_gluc, normal_trig])
-    X_acute = np.column_stack([acute_hr, acute_sdnn, acute_rmssd, acute_spo2, acute_gluc, acute_trig])
+        self.sim_mode = "NORMAL"
+        self.is_running = True
+        self.t_step = 0
 
-    X = np.vstack([X_normal, X_acute])
-    y = np.array([0] * (n_samples // 2) + [1] * (n_samples // 2))
-    return X, y
+        self._build_layout()
+        self.update_simulation()
 
+    def _build_layout(self):
+        # Header Frame
+        header = tk.Frame(self.root, bg="#2d2d2d", padx=15, pady=10)
+        header.pack(fill=tk.X)
 
-def simulate_ecg_waveform(duration_sec=10, fs=250, heart_rate_bpm=75.0, noise_level=0.05):
-    t = np.linspace(0, duration_sec, duration_sec * fs)
-    rr_sec = 60.0 / heart_rate_bpm
-    ecg = np.zeros_like(t)
-    beat_times = np.arange(0.5, duration_sec, rr_sec)
+        title_lbl = tk.Label(header, text="Physiological Telemetry & Autonomous Drug Delivery Monitor", 
+                             font=("Segoe UI", 13, "bold"), fg="#ffffff", bg="#2d2d2d")
+        title_lbl.pack(side=tk.LEFT)
 
-    for bt in beat_times:
-        ecg += 1.2 * np.exp(-((t - bt) ** 2) / (2 * (0.012 ** 2)))
-        ecg -= 0.2 * np.exp(-((t - (bt - 0.03)) ** 2) / (2 * (0.01 ** 2)))
-        ecg += 0.25 * np.exp(-((t - (bt + 0.18)) ** 2) / (2 * (0.04 ** 2)))
+        self.mode_lbl = tk.Label(header, text="STATUS: NORMAL BASELINE", 
+                                 font=("Segoe UI", 10, "bold"), fg="#4CAF50", bg="#2d2d2d")
+        self.mode_lbl.pack(side=tk.RIGHT)
 
-    baseline_drift = 0.15 * np.sin(2 * np.pi * 0.2 * t)
-    noise = np.random.normal(0, noise_level, size=len(t))
-    return ecg + baseline_drift + noise
+        # Main Container
+        main_frame = tk.Frame(self.root, bg="#1e1e1e", padx=10, pady=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Left Column: Graph
+        graph_frame = tk.Frame(main_frame, bg="#252526", padx=5, pady=5)
+        graph_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.fig = Figure(figsize=(6, 5), dpi=100, facecolor='#252526')
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_facecolor('#1e1e1e')
+        self.ax.tick_params(colors='#cccccc', labelsize=8)
+        self.ax.spines['bottom'].set_color('#444444')
+        self.ax.spines['top'].set_color('#444444')
+        self.ax.spines['left'].set_color('#444444')
+        self.ax.spines['right'].set_color('#444444')
+        self.ax.set_title("Real-Time Filtered ECG & R-Peak Detection", color="#ffffff", fontsize=10)
+        self.ax.set_xlabel("Time (seconds)", color="#aaaaaa", fontsize=8)
+        self.ax.set_ylabel("Amplitude (mV)", color="#aaaaaa", fontsize=8)
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # Right Column: Controls & Indicators
+        panel_frame = tk.Frame(main_frame, bg="#252526", width=360, padx=12, pady=10)
+        panel_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+
+        # Simulation Mode Buttons
+        btn_box = tk.LabelFrame(panel_frame, text="Simulation Controls", font=("Segoe UI", 9, "bold"), 
+                                fg="#cccccc", bg="#252526", padx=8, pady=8)
+        btn_box.pack(fill=tk.X, pady=(0, 10))
+
+        btn_normal = tk.Button(btn_box, text="Set Normal Baseline", bg="#3a3a3a", fg="#ffffff", 
+                               relief=tk.FLAT, font=("Segoe UI", 9), command=self._set_normal)
+        btn_normal.pack(fill=tk.X, pady=3)
+
+        btn_acute = tk.Button(btn_box, text="Simulate Acute Cardiac Event", bg="#b71c1c", fg="#ffffff", 
+                              relief=tk.FLAT, font=("Segoe UI", 9, "bold"), command=self._set_acute)
+        btn_acute.pack(fill=tk.X, pady=3)
+
+        # Vitals Telemetry Panel
+        vitals_box = tk.LabelFrame(panel_frame, text="Physiological Metrics", font=("Segoe UI", 9, "bold"), 
+                                   fg="#cccccc", bg="#252526", padx=8, pady=8)
+        vitals_box.pack(fill=tk.X, pady=(0, 10))
+
+        self.lbl_hr = self._add_stat(vitals_box, "Heart Rate:", "72 BPM")
+        self.lbl_sdnn = self._add_stat(vitals_box, "SDNN (HRV):", "52.4 ms")
+        self.lbl_spo2 = self._add_stat(vitals_box, "SpO2 Saturation:", "98 %")
+        self.lbl_glucose = self._add_stat(vitals_box, "Glucose Level:", "105 mg/dL")
+        self.lbl_risk = self._add_stat(vitals_box, "Cardiac Risk Score:", "0.02")
+
+        # Actuator Status Panel
+        act_box = tk.LabelFrame(panel_frame, text="Micro-Valve Actuator Control", font=("Segoe UI", 9, "bold"), 
+                                fg="#cccccc", bg="#252526", padx=8, pady=8)
+        act_box.pack(fill=tk.X, pady=(0, 10))
+
+        self.lbl_valve = self._add_stat(act_box, "Valve Aperture:", "0.0 %")
+        self.lbl_flow = self._add_stat(act_box, "Infusion Flow Rate:", "0.0 uL/min")
+        self.lbl_status = self._add_stat(act_box, "Delivery Status:", "STANDBY")
+
+        # Clinical & Dietary Guidance
+        guidance_box = tk.LabelFrame(panel_frame, text="Metabolic & Dietary Evaluation", font=("Segoe UI", 9, "bold"), 
+                                     fg="#cccccc", bg="#252526", padx=8, pady=8)
+        guidance_box.pack(fill=tk.BOTH, expand=True)
+
+        self.txt_guidance = tk.Text(guidance_box, height=5, bg="#1e1e1e", fg="#e0e0e0", 
+                                    font=("Consolas", 8), relief=tk.FLAT, wrap=tk.WORD)
+        self.txt_guidance.pack(fill=tk.BOTH, expand=True, pady=4)
+
+    def _add_stat(self, parent, label_text, default_val):
+        frame = tk.Frame(parent, bg="#252526")
+        frame.pack(fill=tk.X, pady=2)
+        lbl_title = tk.Label(frame, text=label_text, font=("Segoe UI", 8), fg="#aaaaaa", bg="#252526")
+        lbl_title.pack(side=tk.LEFT)
+        lbl_val = tk.Label(frame, text=default_val, font=("Segoe UI", 8, "bold"), fg="#ffffff", bg="#252526")
+        lbl_val.pack(side=tk.RIGHT)
+        return lbl_val
+
+    def _set_normal(self):
+        self.sim_mode = "NORMAL"
+        self.mode_lbl.config(text="STATUS: NORMAL BASELINE", fg="#4CAF50")
+
+    def _set_acute(self):
+        self.sim_mode = "ACUTE"
+        self.mode_lbl.config(text="STATUS: ACUTE CARDIAC EVENT", fg="#f44336")
+
+    def _generate_ecg_chunk(self):
+        fs = 250
+        duration = 3.0
+        t = np.linspace(0, duration, int(fs * duration))
+        
+        if self.sim_mode == "NORMAL":
+            hr_target = 72.0
+            noise_amp = 0.05
+            qrs_height = 1.2
+            spo2 = 98.0 + np.random.uniform(-1, 1)
+            glucose = 105.0 + np.random.uniform(-3, 3)
+        else:
+            hr_target = 140.0
+            noise_amp = 0.20
+            qrs_height = 0.7
+            spo2 = 88.0 + np.random.uniform(-2, 1)
+            glucose = 165.0 + np.random.uniform(-5, 5)
+
+        freq = hr_target / 60.0
+        # Synthetic ECG generation
+        p_wave = 0.15 * np.sin(2 * np.pi * freq * t - 0.3)
+        qrs = qrs_height * np.exp(-((np.sin(np.pi * freq * t) ** 2) / 0.01))
+        t_wave = 0.25 * np.sin(2 * np.pi * freq * t + 0.5)
+        noise = np.random.normal(0, noise_amp, len(t))
+        raw_ecg = p_wave + qrs + t_wave + noise
+
+        return t, raw_ecg, spo2, glucose
+
+    def update_simulation(self):
+        t, raw_ecg, spo2, glucose = self._generate_ecg_chunk()
+        filtered_ecg, peaks, metrics = self.processor.extract_features(raw_ecg)
+        risk = self.model.evaluate_risk(metrics)
+        actuation = self.actuator.compute_actuation(risk)
+
+        # Plot ECG
+        self.ax.clear()
+        self.ax.set_facecolor('#1e1e1e')
+        self.ax.plot(t, filtered_ecg, color='#00e5ff', lw=1.2, label='Filtered ECG')
+        if len(peaks) > 0:
+            self.ax.plot(t[peaks], filtered_ecg[peaks], "ro", markersize=4, label='R-Peaks')
+        self.ax.set_title("Real-Time Filtered ECG & Peak Detection", color="#ffffff", fontsize=9)
+        self.ax.set_xlabel("Time (s)", color="#aaaaaa", fontsize=8)
+        self.ax.set_ylabel("mV", color="#aaaaaa", fontsize=8)
+        self.ax.tick_params(colors='#cccccc', labelsize=8)
+        self.ax.grid(True, color='#333333', linestyle='--', linewidth=0.5)
+        self.ax.set_ylim(-0.8, 1.8)
+        self.canvas.draw()
+
+        # Update Vitals
+        self.lbl_hr.config(text=f"{metrics['hr_bpm']:.1f} BPM")
+        self.lbl_sdnn.config(text=f"{metrics['sdnn_ms']:.1f} ms")
+        self.lbl_spo2.config(text=f"{spo2:.1f} %", fg="#f44336" if spo2 < 92 else "#ffffff")
+        self.lbl_glucose.config(text=f"{glucose:.1f} mg/dL", fg="#ff9800" if glucose > 140 else "#ffffff")
+        
+        risk_color = "#f44336" if risk > 0.6 else ("#ff9800" if risk > 0.25 else "#4caf50")
+        self.lbl_risk.config(text=f"{risk:.3f}", fg=risk_color)
+
+        # Update Actuator Panel
+        self.lbl_valve.config(text=f"{actuation['valve_open_pct']:.1f} %", fg=risk_color)
+        self.lbl_flow.config(text=f"{actuation['flow_rate_ul_min']:.1f} uL/min")
+        self.lbl_status.config(text=actuation['status'], fg=risk_color)
+
+        # Update Guidance Note
+        self.txt_guidance.delete('1.0', tk.END)
+        if risk > 0.5:
+            self.txt_guidance.insert(tk.END, "[CRITICAL ACTION]: Autonomous micro-valve triggered. Emergency cardiac infusion initiated.\n")
+            self.txt_guidance.insert(tk.END, "- Restrict acute sodium/fluid load.\n- Continuous airway and pulse oximetry monitoring.")
+        else:
+            self.txt_guidance.insert(tk.END, "[METABOLIC STATUS]: Physiologic profile stable.\n")
+            if glucose > 120:
+                self.txt_guidance.insert(tk.END, "- Glycemic trend elevated: recommend low-GI complex carbohydrate adjustment.")
+            else:
+                self.txt_guidance.insert(tk.END, "- Biomarkers within normative target ranges.")
+
+        # Schedule next refresh (every 1.5 seconds)
+        self.root.after(1500, self.update_simulation)
 
 
 if __name__ == "__main__":
-    X, y = build_synthetic_dataset()
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=42)
-
-    clf = RandomForestClassifier(n_estimators=100, max_depth=6, random_state=42)
-    clf.fit(X_train, y_train)
-
-    preds = clf.predict(X_test)
-    print("Model Validation Report:")
-    print(classification_report(y_test, preds, target_names=["Stable", "Acute_Cardiac_Event"]))
-
-    processor = BiosignalProcessor(fs=250)
-    valve = ProportionalValveActuator(kp=1.4, ki=0.05, max_flow_rate_ul_min=50.0)
-    metabolic_analyzer = MetabolicDietAnalyzer()
-
-    raw_ecg_critical = simulate_ecg_waveform(duration_sec=10, fs=250, heart_rate_bpm=142.0, noise_level=0.04)
-    ecg_metrics = processor.extract_ecg_features(raw_ecg_critical)
-
-    patient_Telemetry = {
-        "spo2_pct": 89.5,
-        "glucose_mg_dl": 162.0,
-        "triglycerides_mg_dl": 185.0,
-        "sleep_hours": 5.2,
-    }
-
-    feature_vector = np.array([[
-        ecg_metrics["hr_bpm"],
-        ecg_metrics["sdnn_ms"],
-        ecg_metrics["rmssd_ms"],
-        patient_Telemetry["spo2_pct"],
-        patient_Telemetry["glucose_mg_dl"],
-        patient_Telemetry["triglycerides_mg_dl"],
-    ]])
-
-    risk_prob = float(clf.predict_proba(feature_vector)[0][1])
-    actuation_state = valve.compute_actuation(risk_prob, patient_Telemetry["spo2_pct"])
-    metabolic_report = metabolic_analyzer.evaluate_profile(
-        patient_Telemetry["glucose_mg_dl"],
-        patient_Telemetry["triglycerides_mg_dl"],
-        patient_Telemetry["sleep_hours"],
-        patient_Telemetry["spo2_pct"],
-    )
-
-    print("Telemetry & Closed-Loop Control Output:")
-    print(f"ECG Metrics: {ecg_metrics}")
-    print(f"Cardiac Risk Probability: {risk_prob:.3f}")
-    print(f"Micro-Valve Actuator: {actuation_state}")
-    print(f"Metabolic & Dietary Assessment: {metabolic_report}")
+    root = tk.Tk()
+    app = MonitorGUI(root)
+    root.mainloop()
